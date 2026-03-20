@@ -4,6 +4,7 @@ import L from 'leaflet';
 import { Search, Filter, Map as MapIcon, List, Info, X, Plus, Image as ImageIcon, Trash2, Settings, ChevronLeft, ChevronRight, ChevronDown, RefreshCw } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Institution, DEPARTMENTS, INSTITUTION_TYPES } from './types';
+import { loadBrowserInstitutions, saveBrowserInstitutions } from './browserStore';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
@@ -32,37 +33,75 @@ const utuIcon = L.divIcon({
 
 const URUGUAY_CENTER: [number, number] = [-32.5228, -55.7658];
 const DEFAULT_ZOOM = 7;
+const DEFAULT_FORM_DATA: Partial<Institution> = {
+  name: '',
+  type: 'liceo',
+  department: 'Montevideo',
+  address: '',
+  lat: -34.9011,
+  lng: -56.1645,
+  description: '',
+  images: [],
+  hasDiningRoom: false
+};
+const MAX_IMAGE_DIMENSION = 1600;
+const TARGET_IMAGE_MAX_BYTES = 1_200_000;
+const MIN_IMAGE_QUALITY = 0.45;
 
-// Helper to compress images before saving to base64
-const compressImage = (base64Str: string, maxWidth = 1200, maxHeight = 1200, quality = 0.7): Promise<string> => {
-  return new Promise((resolve) => {
-    const img = new Image();
-    img.src = base64Str;
-    img.onload = () => {
-      const canvas = document.createElement('canvas');
-      let width = img.width;
-      let height = img.height;
+function dataUrlByteLength(dataUrl: string) {
+  const base64 = dataUrl.split(',')[1] ?? '';
+  const paddingMatch = base64.match(/=+$/);
+  const padding = paddingMatch ? paddingMatch[0].length : 0;
+  return Math.floor((base64.length * 3) / 4) - padding;
+}
 
-      if (width > height) {
-        if (width > maxWidth) {
-          height *= maxWidth / width;
-          width = maxWidth;
-        }
-      } else {
-        if (height > maxHeight) {
-          width *= maxHeight / height;
-          height = maxHeight;
+async function compressImage(file: File) {
+  const bitmap = await createImageBitmap(file);
+
+  try {
+    let width = bitmap.width;
+    let height = bitmap.height;
+    const scale = Math.min(1, MAX_IMAGE_DIMENSION / Math.max(width, height));
+
+    width = Math.max(1, Math.round(width * scale));
+    height = Math.max(1, Math.round(height * scale));
+
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+
+    if (!ctx) {
+      throw new Error('No se pudo inicializar el compresor de imágenes');
+    }
+
+    const qualitySteps = [0.82, 0.72, 0.62, 0.52, MIN_IMAGE_QUALITY];
+    let lastResult = '';
+
+    while (true) {
+      canvas.width = width;
+      canvas.height = height;
+      ctx.clearRect(0, 0, width, height);
+      ctx.drawImage(bitmap, 0, 0, width, height);
+
+      for (const quality of qualitySteps) {
+        const compressed = canvas.toDataURL('image/jpeg', quality);
+        lastResult = compressed;
+
+        if (dataUrlByteLength(compressed) <= TARGET_IMAGE_MAX_BYTES) {
+          return compressed;
         }
       }
 
-      canvas.width = width;
-      canvas.height = height;
-      const ctx = canvas.getContext('2d');
-      ctx?.drawImage(img, 0, 0, width, height);
-      resolve(canvas.toDataURL('image/jpeg', quality));
-    };
-  });
-};
+      if (Math.max(width, height) <= 720) {
+        return lastResult;
+      }
+
+      width = Math.max(1, Math.round(width * 0.8));
+      height = Math.max(1, Math.round(height * 0.8));
+    }
+  } finally {
+    bitmap.close();
+  }
+}
 
 const URUGUAY_BOUNDS: L.LatLngBoundsExpression = [
   [-35.5, -59.5], // Southwest
@@ -77,10 +116,42 @@ let staticInstitutionsPromise: Promise<Institution[]> | null = null;
 function normalizeInstitution(inst: Institution): Institution {
   return {
     ...inst,
+    id: Number(inst.id),
+    lat: Number(inst.lat),
+    lng: Number(inst.lng),
     description: inst.description ?? '',
     images: Array.isArray(inst.images) ? inst.images : [],
     hasDiningRoom: Boolean(inst.hasDiningRoom)
   };
+}
+
+function createInstitutionFromForm(formData: Partial<Institution>, institutions: Institution[]) {
+  const nextId = formData.id ?? institutions.reduce((maxId, inst) => Math.max(maxId, inst.id), 0) + 1;
+
+  return normalizeInstitution({
+    id: nextId,
+    name: formData.name?.trim() || 'Sin nombre',
+    type: (formData.type as Institution['type']) ?? 'liceo',
+    department: formData.department?.trim() || 'Montevideo',
+    address: formData.address?.trim() || '',
+    lat: Number(formData.lat ?? DEFAULT_FORM_DATA.lat),
+    lng: Number(formData.lng ?? DEFAULT_FORM_DATA.lng),
+    description: formData.description?.trim() || '',
+    images: Array.isArray(formData.images) ? formData.images : [],
+    hasDiningRoom: Boolean(formData.hasDiningRoom)
+  });
+}
+
+function validateInstitutionForm(formData: Partial<Institution>) {
+  if (!formData.name?.trim()) {
+    return 'El nombre es obligatorio.';
+  }
+
+  if (!Number.isFinite(Number(formData.lat)) || !Number.isFinite(Number(formData.lng))) {
+    return 'La latitud y la longitud deben ser números válidos.';
+  }
+
+  return null;
 }
 
 function isInstitutionArray(data: unknown): data is Institution[] {
@@ -167,6 +238,7 @@ function MapResetHandler({ trigger }: { trigger: number }) {
 
 export default function App() {
   const [institutions, setInstitutions] = useState<Institution[]>([]);
+  const [persistenceMode, setPersistenceMode] = useState<'api' | 'browser'>('api');
   const [selectedType, setSelectedType] = useState<string>('all');
   const [viewMode, setViewMode] = useState<'map' | 'list'>('map');
   const [selectedDept, setSelectedDept] = useState<string>('all');
@@ -195,6 +267,10 @@ export default function App() {
     setSelectedInstitution(null);
     setFocusedInstitutionId(null);
     setResetMapTrigger(prev => prev + 1);
+  };
+
+  const resetFormState = () => {
+    setFormData({ ...DEFAULT_FORM_DATA });
   };
 
   const handlePinInput = (num: string) => {
@@ -267,17 +343,7 @@ export default function App() {
   }, [isAutoPlaying, selectedInstitution, currentImageIndex]);
   
   // Form state for adding/editing
-  const [formData, setFormData] = useState<Partial<Institution>>({
-    name: '',
-    type: 'liceo',
-    department: 'Montevideo',
-    address: '',
-    lat: -34.9011,
-    lng: -56.1645,
-    description: '',
-    images: [],
-    hasDiningRoom: false
-  });
+  const [formData, setFormData] = useState<Partial<Institution>>(DEFAULT_FORM_DATA);
 
   useEffect(() => {
     fetchInstitutions();
@@ -298,8 +364,22 @@ export default function App() {
       console.warn(reason);
 
       try {
+        const browserInstitutions = await loadBrowserInstitutions();
+        if (browserInstitutions && browserInstitutions.length > 0) {
+          const normalizedBrowserInstitutions = browserInstitutions.map(normalizeInstitution);
+          console.log("Loaded browser institutions:", normalizedBrowserInstitutions.length);
+          setPersistenceMode('browser');
+          setInstitutions(normalizedBrowserInstitutions);
+          return normalizedBrowserInstitutions;
+        }
+      } catch (browserErr) {
+        console.error("Error loading browser institutions:", browserErr);
+      }
+
+      try {
         const staticInstitutions = await loadStaticInstitutions();
         console.log("Loaded static institutions:", staticInstitutions.length);
+        setPersistenceMode('browser');
         setInstitutions(staticInstitutions);
         return staticInstitutions;
       } catch (fallbackErr) {
@@ -326,7 +406,11 @@ export default function App() {
 
       const normalizedInstitutions = data.map(normalizeInstitution);
       console.log("Fetched institutions:", normalizedInstitutions);
+      setPersistenceMode('api');
       setInstitutions(normalizedInstitutions);
+      saveBrowserInstitutions(normalizedInstitutions).catch((browserErr) => {
+        console.error("Error syncing institutions to browser storage:", browserErr);
+      });
       return normalizedInstitutions;
     } catch (err) {
       console.error("Error fetching institutions:", err);
@@ -353,6 +437,16 @@ export default function App() {
     } catch (err) {
       console.error("Error fetching details:", err);
       try {
+        const browserInstitutions = await loadBrowserInstitutions();
+        const browserMatch = browserInstitutions?.find(item => item.id === inst.id);
+
+        if (browserMatch) {
+          const normalizedBrowserMatch = normalizeInstitution(browserMatch);
+          setInstitutions(prev => prev.map(i => i.id === inst.id ? normalizedBrowserMatch : i));
+          setSelectedInstitution(normalizedBrowserMatch);
+          return;
+        }
+
         const staticInstitutions = await loadStaticInstitutions();
         const staticMatch = staticInstitutions.find(item => item.id === inst.id);
 
@@ -391,9 +485,35 @@ export default function App() {
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
+    const validationError = validateInstitutionForm(formData);
+
+    if (validationError) {
+      alert(validationError);
+      return;
+    }
+
     setIsSaving(true);
     const method = formData.id ? 'PUT' : 'POST';
     const url = formData.id ? `/api/institutions/${formData.id}` : '/api/institutions';
+    const persistInBrowser = async (message: string) => {
+      const savedInstitution = createInstitutionFromForm(formData, institutions);
+      const nextInstitutions = formData.id
+        ? institutions.map(inst => inst.id === savedInstitution.id ? savedInstitution : inst)
+        : [...institutions, savedInstitution];
+      const normalizedInstitutions = nextInstitutions.map(normalizeInstitution);
+
+      await saveBrowserInstitutions(normalizedInstitutions);
+      setPersistenceMode('browser');
+      setInstitutions(normalizedInstitutions);
+
+      if (selectedInstitution?.id === savedInstitution.id) {
+        setSelectedInstitution(savedInstitution);
+      }
+
+      setIsAdding(false);
+      resetFormState();
+      alert(message);
+    };
     
     try {
       const res = await fetch(url, {
@@ -401,9 +521,11 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(formData)
       });
-      if (!res.ok) throw new Error("Failed to save");
-      
-      const savedData = await res.json();
+      const responseData = await res.json().catch(() => null);
+      if (!res.ok) {
+        throw new Error(responseData?.error || `No se pudo guardar (${res.status})`);
+      }
+
       const allInstitutions = await fetchInstitutions();
       
       // If we were editing the currently selected institution, update it too
@@ -422,19 +544,15 @@ export default function App() {
       }
 
       setIsAdding(false);
-      setFormData({
-        name: '',
-        type: 'liceo',
-        department: 'Montevideo',
-        address: '',
-        lat: -34.9011,
-        lng: -56.1645,
-        description: '',
-        images: [],
-        hasDiningRoom: false
-      });
+      resetFormState();
     } catch (err) {
       console.error("Error saving:", err);
+      try {
+        await persistInBrowser('La API no estuvo disponible. Los cambios se guardaron en este navegador.');
+        return;
+      } catch (browserErr) {
+        console.error("Error saving in browser storage:", browserErr);
+      }
       alert("Error al guardar. Verifique los datos y el tamaño de las imágenes.");
     } finally {
       setIsSaving(false);
@@ -1086,6 +1204,16 @@ export default function App() {
 
                   {isAdding ? (
                     <form onSubmit={handleSave} className="space-y-4 max-w-2xl mx-auto">
+                      <div className={cn(
+                        "rounded-2xl border px-4 py-3 text-sm",
+                        persistenceMode === 'api'
+                          ? "bg-emerald-50 border-emerald-200 text-emerald-800"
+                          : "bg-amber-50 border-amber-200 text-amber-800"
+                      )}>
+                        {persistenceMode === 'api'
+                          ? 'Los cambios se guardan en la base local/API del proyecto.'
+                          : 'Esta sesión está guardando en el navegador. Sirve para Vercel estático o cuando la API no responde.'}
+                      </div>
                       <div className="grid grid-cols-2 gap-4">
                         <div className="col-span-2">
                           <label className="block text-xs font-bold text-stone-500 uppercase mb-1">Nombre</label>
@@ -1175,25 +1303,22 @@ export default function App() {
                                 onChange={async (e) => {
                                   const files = e.target.files;
                                   if (files) {
-                                    const fileArray = Array.from(files);
-                                    const compressedImages = await Promise.all(
-                                      fileArray.map(async (file: File) => {
-                                        return new Promise<string>((resolve) => {
-                                          const reader = new FileReader();
-                                          reader.onloadend = async () => {
-                                            const base64String = reader.result as string;
-                                            const compressed = await compressImage(base64String);
-                                            resolve(compressed);
-                                          };
-                                          reader.readAsDataURL(file);
-                                        });
-                                      })
-                                    );
-                                    
-                                    setFormData(prev => ({
-                                      ...prev,
-                                      images: [...(prev.images || []), ...compressedImages]
-                                    }));
+                                    try {
+                                      const fileArray = Array.from(files);
+                                      const compressedImages = await Promise.all(
+                                        fileArray.map((file: File) => compressImage(file))
+                                      );
+                                      
+                                      setFormData(prev => ({
+                                        ...prev,
+                                        images: [...(prev.images || []), ...compressedImages]
+                                      }));
+                                    } catch (imageErr) {
+                                      console.error('Error compressing images:', imageErr);
+                                      alert('No se pudo procesar alguna imagen. Intenta nuevamente con otro archivo.');
+                                    } finally {
+                                      e.target.value = '';
+                                    }
                                   }
                                 }}
                               />
@@ -1265,7 +1390,7 @@ export default function App() {
                         <h3 className="font-bold text-stone-500 uppercase text-xs tracking-widest">Lista de Instituciones</h3>
                         <button 
                           onClick={() => {
-                            setFormData({ name: '', type: 'liceo', department: 'Montevideo', address: '', lat: -34.9011, lng: -56.1645, description: '', images: [], hasDiningRoom: false });
+                            resetFormState();
                             setIsAdding(true);
                           }}
                           className="bg-sky-600 text-white px-4 py-2 rounded-full text-sm font-bold flex items-center gap-2 hover:bg-sky-700 shadow-md shadow-sky-100"
@@ -1307,10 +1432,21 @@ export default function App() {
                                           const fullData = await res.json();
                                           setFormData(fullData);
                                         } else {
-                                          setFormData(inst);
+                                          const browserInstitutions = await loadBrowserInstitutions();
+                                          const browserMatch = browserInstitutions?.find(item => item.id === inst.id);
+                                          setFormData(browserMatch || inst);
                                         }
                                       } catch (e) {
-                                        setFormData(inst);
+                                        try {
+                                          const browserInstitutions = await loadBrowserInstitutions();
+                                          const browserMatch = browserInstitutions?.find(item => item.id === inst.id);
+                                          const staticInstitutions = await loadStaticInstitutions();
+                                          const staticMatch = staticInstitutions.find(item => item.id === inst.id);
+                                          setFormData(browserMatch || staticMatch || inst);
+                                        } catch (fallbackErr) {
+                                          console.error('Error loading institution for edit:', fallbackErr);
+                                          setFormData(inst);
+                                        }
                                       }
                                       setIsAdding(true); 
                                     }}

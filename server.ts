@@ -12,6 +12,7 @@ console.log("Starting server initialization...");
 const dbPath = path.join(__dirname, "edumap.db");
 console.log(`Database path: ${dbPath}`);
 const db = new Database(dbPath);
+const BODY_LIMIT = '250mb';
 
 async function startServer() {
   console.log("Initializing database...");
@@ -118,8 +119,19 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  app.use(express.json({ limit: '50mb' }));
-  app.use(express.urlencoded({ limit: '50mb', extended: true }));
+  app.use(express.json({ limit: BODY_LIMIT }));
+  app.use(express.urlencoded({ limit: BODY_LIMIT, extended: true }));
+  app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (err?.type === 'entity.too.large') {
+      return res.status(413).json({ error: `El contenido enviado supera el límite del servidor (${BODY_LIMIT}).` });
+    }
+
+    if (err instanceof SyntaxError) {
+      return res.status(400).json({ error: 'La solicitud enviada no tiene un JSON válido.' });
+    }
+
+    return next(err);
+  });
 
   // Health check
   app.get("/api/health", (req, res) => {
