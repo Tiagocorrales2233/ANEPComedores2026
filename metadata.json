@@ -1,0 +1,5 @@
+{
+  "name": "ANEP - Mapa Educativo",
+  "description": "Mapa interactivo de centros educativos (Liceos y UTU) de la ANEP en Uruguay con información de comedores.",
+  "requestFramePermissions": ["geolocation"]
+}
