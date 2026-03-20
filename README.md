@@ -18,3 +18,9 @@ View your app in AI Studio: https://ai.studio/apps/42244be6-dbb3-4d82-a7ec-65938
 2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
 3. Run the app:
    `npm run dev`
+
+## Production persistence
+
+If you want data and image uploads to work from any computer in Vercel, follow:
+
+`SUPABASE_SETUP.md`

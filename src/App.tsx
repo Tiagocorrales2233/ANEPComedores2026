@@ -5,6 +5,7 @@ import { Search, Filter, Map as MapIcon, List, Info, X, Plus, Image as ImageIcon
 import { motion, AnimatePresence } from 'motion/react';
 import { Institution, DEPARTMENTS, INSTITUTION_TYPES } from './types';
 import { loadBrowserInstitutions, saveBrowserInstitutions } from './browserStore';
+import { getSupabaseInstitution, hasSupabaseConfig, listSupabaseInstitutions, saveSupabaseInstitution } from './supabase';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
@@ -101,6 +102,22 @@ async function compressImage(file: File) {
   } finally {
     bitmap.close();
   }
+}
+
+async function compressImages(files: File[]) {
+  const compressedImages: string[] = [];
+  const failedFiles: string[] = [];
+
+  for (const file of files) {
+    try {
+      compressedImages.push(await compressImage(file));
+    } catch (error) {
+      console.error(`Error processing image "${file.name}":`, error);
+      failedFiles.push(file.name);
+    }
+  }
+
+  return { compressedImages, failedFiles };
 }
 
 const URUGUAY_BOUNDS: L.LatLngBoundsExpression = [
@@ -238,7 +255,9 @@ function MapResetHandler({ trigger }: { trigger: number }) {
 
 export default function App() {
   const [institutions, setInstitutions] = useState<Institution[]>([]);
-  const [persistenceMode, setPersistenceMode] = useState<'api' | 'browser'>('api');
+  const [persistenceMode, setPersistenceMode] = useState<'api' | 'browser' | 'supabase'>(
+    hasSupabaseConfig ? 'supabase' : 'api'
+  );
   const [selectedType, setSelectedType] = useState<string>('all');
   const [viewMode, setViewMode] = useState<'map' | 'list'>('map');
   const [selectedDept, setSelectedDept] = useState<string>('all');
@@ -248,6 +267,7 @@ export default function App() {
   const [focusedInstitutionId, setFocusedInstitutionId] = useState<number | null>(null);
   const [isMapMoving, setIsMapMoving] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const [isProcessingImages, setIsProcessingImages] = useState(false);
   const [resetMapTrigger, setResetMapTrigger] = useState(0);
   const [currentImageIndex, setCurrentImageIndex] = useState(0);
   const [isAutoPlaying, setIsAutoPlaying] = useState(true);
@@ -390,6 +410,17 @@ export default function App() {
     };
 
     try {
+      if (hasSupabaseConfig) {
+        const supabaseInstitutions = await listSupabaseInstitutions();
+        console.log("Fetched institutions from Supabase:", supabaseInstitutions);
+        setPersistenceMode('supabase');
+        setInstitutions(supabaseInstitutions);
+        saveBrowserInstitutions(supabaseInstitutions).catch((browserErr) => {
+          console.error("Error syncing Supabase institutions to browser storage:", browserErr);
+        });
+        return supabaseInstitutions;
+      }
+
       const res = await fetch('/api/institutions');
       if (!res.ok) {
         return loadFallback(`API institutions request failed with ${res.status}`);
@@ -426,6 +457,13 @@ export default function App() {
     
     setIsLoadingDetails(true);
     try {
+      if (hasSupabaseConfig) {
+        const fullData = await getSupabaseInstitution(inst.id);
+        setInstitutions(prev => prev.map(i => i.id === inst.id ? fullData : i));
+        setSelectedInstitution(fullData);
+        return;
+      }
+
       const res = await fetch(`/api/institutions/${inst.id}`);
       if (!res.ok) throw new Error("Failed to fetch details");
       const fullData = await res.json();
@@ -516,6 +554,20 @@ export default function App() {
     };
     
     try {
+      if (hasSupabaseConfig) {
+        const savedInstitution = await saveSupabaseInstitution(formData);
+        const allInstitutions = await fetchInstitutions();
+
+        if (selectedInstitution && selectedInstitution.id === savedInstitution.id) {
+          const updated = allInstitutions.find((i: Institution) => i.id === savedInstitution.id);
+          setSelectedInstitution(updated || savedInstitution);
+        }
+
+        setIsAdding(false);
+        resetFormState();
+        return;
+      }
+
       const res = await fetch(url, {
         method,
         headers: { 'Content-Type': 'application/json' },
@@ -547,6 +599,12 @@ export default function App() {
       resetFormState();
     } catch (err) {
       console.error("Error saving:", err);
+      if (hasSupabaseConfig) {
+        const errorMessage = err instanceof Error ? err.message : 'No se pudo guardar en Supabase.';
+        alert(`No se pudo guardar en la base remota. ${errorMessage}`);
+        return;
+      }
+
       try {
         await persistInBrowser('La API no estuvo disponible. Los cambios se guardaron en este navegador.');
         return;
@@ -1133,7 +1191,7 @@ export default function App() {
                     Panel de Administración
                   </h2>
                   <div className="flex items-center gap-3">
-                    {syncStatus.type === 'confirm' ? (
+                    {!hasSupabaseConfig && (syncStatus.type === 'confirm' ? (
                       <div className="flex items-center gap-2 bg-amber-50 border border-amber-200 p-1 rounded-xl">
                         <span className="text-[10px] font-bold text-amber-800 px-2">¿Confirmar reemplazo de datos?</span>
                         <button 
@@ -1167,7 +1225,7 @@ export default function App() {
                          syncStatus.type === 'error' ? "Error" :
                          "Sincronizar desde Publicado"}
                       </button>
-                    )}
+                    ))}
                     <button onClick={() => setIsAdminOpen(false)} className="p-2 hover:bg-stone-200 rounded-full transition-colors">
                       <X size={24} />
                     </button>
@@ -1185,6 +1243,11 @@ export default function App() {
                     </div>
                   )}
 
+                  {hasSupabaseConfig ? (
+                    <div className="mb-8 p-4 bg-sky-50 rounded-2xl border border-sky-100 text-sm text-sky-800">
+                      Supabase estÃ¡ configurado. Los datos y las imÃ¡genes se guardarÃ¡n en la base remota y en Storage.
+                    </div>
+                  ) : (
                   <div className="mb-8 p-4 bg-stone-50 rounded-2xl border border-stone-100">
                     <h3 className="text-xs font-black text-stone-400 uppercase tracking-widest mb-3">Configuración de Sincronización</h3>
                     <div className="flex gap-3">
@@ -1201,16 +1264,21 @@ export default function App() {
                       </p>
                     </div>
                   </div>
+                  )}
 
                   {isAdding ? (
                     <form onSubmit={handleSave} className="space-y-4 max-w-2xl mx-auto">
                       <div className={cn(
                         "rounded-2xl border px-4 py-3 text-sm",
-                        persistenceMode === 'api'
+                        persistenceMode === 'supabase'
+                          ? "bg-sky-50 border-sky-200 text-sky-800"
+                          : persistenceMode === 'api'
                           ? "bg-emerald-50 border-emerald-200 text-emerald-800"
                           : "bg-amber-50 border-amber-200 text-amber-800"
                       )}>
-                        {persistenceMode === 'api'
+                        {persistenceMode === 'supabase'
+                          ? 'Los cambios se guardan en Supabase: base remota y storage de imágenes. Si algo falla, se te avisa y no queda guardado solo en este navegador.'
+                          : persistenceMode === 'api'
                           ? 'Los cambios se guardan en la base local/API del proyecto.'
                           : 'Esta sesión está guardando en el navegador. Sirve para Vercel estático o cuando la API no responde.'}
                       </div>
@@ -1303,20 +1371,26 @@ export default function App() {
                                 onChange={async (e) => {
                                   const files = e.target.files;
                                   if (files) {
+                                    setIsProcessingImages(true);
                                     try {
-                                      const fileArray = Array.from(files);
-                                      const compressedImages = await Promise.all(
-                                        fileArray.map((file: File) => compressImage(file))
-                                      );
+                                      const fileArray = Array.from(files as FileList);
+                                      const { compressedImages, failedFiles } = await compressImages(fileArray);
                                       
-                                      setFormData(prev => ({
-                                        ...prev,
-                                        images: [...(prev.images || []), ...compressedImages]
-                                      }));
+                                      if (compressedImages.length > 0) {
+                                        setFormData(prev => ({
+                                          ...prev,
+                                          images: [...(prev.images || []), ...compressedImages]
+                                        }));
+                                      }
+
+                                      if (failedFiles.length > 0) {
+                                        alert(`No se pudieron procesar ${failedFiles.length} imagen(es): ${failedFiles.join(', ')}.`);
+                                      }
                                     } catch (imageErr) {
                                       console.error('Error compressing images:', imageErr);
                                       alert('No se pudo procesar alguna imagen. Intenta nuevamente con otro archivo.');
                                     } finally {
+                                      setIsProcessingImages(false);
                                       e.target.value = '';
                                     }
                                   }
@@ -1324,12 +1398,20 @@ export default function App() {
                               />
                               <label 
                                 htmlFor="image-upload"
-                                className="flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-stone-100 border-2 border-dashed border-stone-300 rounded-xl cursor-pointer hover:bg-stone-200 hover:border-sky-400 transition-all text-stone-600 font-bold text-sm"
+                                className={cn(
+                                  "flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-stone-100 border-2 border-dashed border-stone-300 rounded-xl transition-all text-stone-600 font-bold text-sm",
+                                  isProcessingImages
+                                    ? "cursor-wait opacity-70"
+                                    : "cursor-pointer hover:bg-stone-200 hover:border-sky-400"
+                                )}
                               >
                                 <Plus size={20} className="text-sky-600" />
-                                <span>Seleccionar imágenes de la computadora</span>
+                                <span>{isProcessingImages ? 'Procesando imágenes...' : 'Seleccionar imágenes de la computadora'}</span>
                               </label>
                             </div>
+                            <p className="text-[11px] text-stone-500">
+                              Las imágenes se optimizan antes de guardarse. Con Supabase activo, luego se suben al storage remoto.
+                            </p>
                             <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 gap-2">
                               {formData.images.map((img, idx) => (
                                 <div key={idx} className="relative aspect-square rounded-xl overflow-hidden group border border-stone-200">
@@ -1360,16 +1442,16 @@ export default function App() {
                       <div className="flex gap-3 pt-4">
                         <button 
                           type="submit"
-                          disabled={isSaving}
+                          disabled={isSaving || isProcessingImages}
                           className={cn(
                             "flex-1 text-white py-3 rounded-xl font-bold shadow-lg transition-all flex items-center justify-center gap-2",
-                            isSaving ? "bg-stone-400 cursor-not-allowed" : "bg-sky-600 hover:bg-sky-700 shadow-sky-200"
+                            isSaving || isProcessingImages ? "bg-stone-400 cursor-not-allowed" : "bg-sky-600 hover:bg-sky-700 shadow-sky-200"
                           )}
                         >
-                          {isSaving ? (
+                          {isSaving || isProcessingImages ? (
                             <>
                               <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                              Guardando...
+                              {isSaving ? 'Guardando...' : 'Procesando imágenes...'}
                             </>
                           ) : (
                             formData.id ? 'Guardar Cambios' : 'Crear Institución'
@@ -1427,14 +1509,19 @@ export default function App() {
                                     onClick={async () => { 
                                       // Fetch full details before editing to avoid partial data overwrite
                                       try {
-                                        const res = await fetch(`/api/institutions/${inst.id}`);
-                                        if (res.ok) {
-                                          const fullData = await res.json();
+                                        if (hasSupabaseConfig) {
+                                          const fullData = await getSupabaseInstitution(inst.id);
                                           setFormData(fullData);
                                         } else {
-                                          const browserInstitutions = await loadBrowserInstitutions();
-                                          const browserMatch = browserInstitutions?.find(item => item.id === inst.id);
-                                          setFormData(browserMatch || inst);
+                                          const res = await fetch(`/api/institutions/${inst.id}`);
+                                          if (res.ok) {
+                                            const fullData = await res.json();
+                                            setFormData(fullData);
+                                          } else {
+                                            const browserInstitutions = await loadBrowserInstitutions();
+                                            const browserMatch = browserInstitutions?.find(item => item.id === inst.id);
+                                            setFormData(browserMatch || inst);
+                                          }
                                         }
                                       } catch (e) {
                                         try {
